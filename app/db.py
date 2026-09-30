@@ -14,6 +14,7 @@ from psycopg_pool import ConnectionPool
 
 from .errors import (
     InvalidCancelTokenError,
+    InvalidQueryTokenError,
     NotFoundError,
     NoPublishedVersionError,
     ReservationChangeConflictError,
@@ -21,6 +22,8 @@ from .errors import (
     RevisionConflictError,
     VersionConflictError,
     VersionNotFoundError,
+    WaitlistEntryNotFoundError,
+    WaitlistNotWithdrawableError,
 )
 from .scheduler import (
     MakeupRule,
@@ -348,11 +351,17 @@ def check_cancel_token(row: dict, cancel_token: str | None) -> None:
 def insert_reservation(
     cur: psycopg.Cursor,
     point_id: int,
-    idempotency_key: str,
+    idempotency_key: str | None,
     start_utc: datetime,
     end_utc: datetime,
     rules_version: int,
 ) -> dict:
+    """Insert one active reservation.
+
+    ``idempotency_key`` is NULL for system-generated rows (waitlist
+    promotions): they live outside the client idempotency space and multiple
+    NULLs never collide under the UNIQUE constraint.
+    """
     return cur.execute(
         f"INSERT INTO reservations "
         f"(point_id, idempotency_key, start_utc, end_utc, rules_version, "
@@ -516,3 +525,188 @@ def assert_reservations_fit(
             f"no longer be fully open under the proposed change",
             details={"conflicting_reservation_ids": violating},
         )
+
+
+# ---------------------------------------------------------------------------
+# Waitlist
+# ---------------------------------------------------------------------------
+
+_WAITLIST_COLS = (
+    "id, point_id, idempotency_key, start_utc, end_utc, rules_version, "
+    "query_token, status, promoted_reservation_id, created_at, decided_at"
+)
+
+
+def get_reservation(
+    cur: psycopg.Cursor, point_id: int, reservation_id: int
+) -> dict | None:
+    """Read one reservation without locking (None when absent)."""
+    return cur.execute(
+        f"SELECT {_RESERVATION_COLS} FROM reservations "
+        "WHERE id = %s AND point_id = %s",
+        (reservation_id, point_id),
+    ).fetchone()
+
+
+def get_waitlist_entry_by_key(
+    cur: psycopg.Cursor, point_id: int, idempotency_key: str
+) -> dict | None:
+    return cur.execute(
+        f"SELECT {_WAITLIST_COLS} FROM waitlist_entries "
+        "WHERE point_id = %s AND idempotency_key = %s",
+        (point_id, idempotency_key),
+    ).fetchone()
+
+
+def get_waitlist_entry(
+    cur: psycopg.Cursor, point_id: int, entry_id: int
+) -> dict:
+    row = cur.execute(
+        f"SELECT {_WAITLIST_COLS} FROM waitlist_entries "
+        "WHERE id = %s AND point_id = %s",
+        (entry_id, point_id),
+    ).fetchone()
+    if row is None:
+        raise WaitlistEntryNotFoundError(
+            f"waitlist entry {entry_id} of point {point_id} does not exist",
+            details={"point_id": point_id, "entry_id": entry_id},
+        )
+    return row
+
+
+def get_waitlist_entry_for_update(
+    cur: psycopg.Cursor, point_id: int, entry_id: int
+) -> dict:
+    """Lock the waitlist row and return it, or raise 404."""
+    row = cur.execute(
+        f"SELECT {_WAITLIST_COLS} FROM waitlist_entries "
+        "WHERE id = %s AND point_id = %s FOR UPDATE",
+        (entry_id, point_id),
+    ).fetchone()
+    if row is None:
+        raise WaitlistEntryNotFoundError(
+            f"waitlist entry {entry_id} of point {point_id} does not exist",
+            details={"point_id": point_id, "entry_id": entry_id},
+        )
+    return row
+
+
+def check_query_token(row: dict, query_token: str | None) -> None:
+    """Validate a capability token against a waitlist entry row."""
+    if query_token is None:
+        raise InvalidQueryTokenError("query_token is required")
+    if not secrets.compare_digest(row["query_token"], query_token):
+        raise InvalidQueryTokenError("query_token does not match")
+
+
+def insert_waitlist_entry(
+    cur: psycopg.Cursor,
+    point_id: int,
+    idempotency_key: str,
+    start_utc: datetime,
+    end_utc: datetime,
+    rules_version: int,
+) -> dict:
+    return cur.execute(
+        f"INSERT INTO waitlist_entries "
+        f"(point_id, idempotency_key, start_utc, end_utc, rules_version, "
+        f" query_token) "
+        f"VALUES (%s, %s, %s, %s, %s, %s) "
+        f"RETURNING {_WAITLIST_COLS}",
+        (
+            point_id,
+            idempotency_key,
+            start_utc,
+            end_utc,
+            rules_version,
+            secrets.token_urlsafe(32),
+        ),
+    ).fetchone()
+
+
+def withdraw_waitlist_entry(
+    cur: psycopg.Cursor, point_id: int, entry_id: int, query_token: str | None
+) -> dict:
+    """Withdraw a queued entry; idempotent on repeat calls with the token."""
+    row = get_waitlist_entry_for_update(cur, point_id, entry_id)
+    check_query_token(row, query_token)
+    if row["status"] == "queued":
+        return cur.execute(
+            f"UPDATE waitlist_entries SET status = 'withdrawn', "
+            f"decided_at = now() WHERE id = %s RETURNING {_WAITLIST_COLS}",
+            (entry_id,),
+        ).fetchone()
+    if row["status"] == "withdrawn":
+        return row
+    raise WaitlistNotWithdrawableError(
+        f"waitlist entry {entry_id} is {row['status']} and cannot be "
+        f"withdrawn",
+        details={
+            "entry_id": entry_id,
+            "status": row["status"],
+            "reason": f"already_{row['status']}",
+        },
+    )
+
+
+def process_waitlist(
+    cur: psycopg.Cursor, point_id: int, now: datetime
+) -> list[dict]:
+    """Promote queued waitlist entries after a cancellation/reschedule release.
+
+    The caller holds the point row lock and runs inside the releasing
+    transaction, so promotions serialize against concurrent bookings,
+    reschedules, cancellations and rule publishes, and any failure here rolls
+    the release and the waitlist state changes back together.
+
+    Entries are inspected in application order (``id``): a start that has
+    already passed is marked ``expired``; a window no longer open under the
+    current rules, or still overlapping an active reservation, stays queued;
+    the earliest eligible entry is promoted into a real reservation issued
+    under the *current* rules version.  An entry is promoted at most once —
+    ``promoted`` is terminal and never re-enters the queue.
+    """
+    rows = cur.execute(
+        f"SELECT {_WAITLIST_COLS} FROM waitlist_entries "
+        "WHERE point_id = %s AND status = 'queued' ORDER BY id FOR UPDATE",
+        (point_id,),
+    ).fetchall()
+    if not rows:
+        return []
+    point = get_point(cur, point_id)
+    latest = get_latest_payload(cur, point_id)
+    if latest is None:  # defensive: a queued entry implies a published version
+        return []
+    zone = get_zone(point["timezone"])
+    ruleset = payload_to_ruleset(latest["payload"])
+    rules_version = latest["version"]
+    promoted: list[dict] = []
+    for entry in rows:
+        start, end = entry["start_utc"], entry["end_utc"]
+        if start <= now:
+            cur.execute(
+                "UPDATE waitlist_entries SET status = 'expired', "
+                "decided_at = now() WHERE id = %s",
+                (entry["id"],),
+            )
+            continue
+        date_from = (start - timedelta(days=1)).astimezone(zone).date()
+        date_to = (end + timedelta(days=1)).astimezone(zone).date()
+        intervals = build_open_intervals(
+            point["timezone"], ruleset, date_from, date_to
+        )
+        if not any(s <= start and end <= e for s, e in intervals):
+            continue  # not open under the current rules: stays queued
+        if find_overlapping(cur, point_id, start, end):
+            continue  # still blocked by an active reservation: stays queued
+        reservation = insert_reservation(
+            cur, point_id, None, start, end, rules_version
+        )
+        row = cur.execute(
+            f"UPDATE waitlist_entries SET status = 'promoted', "
+            f"promoted_reservation_id = %s, decided_at = now() "
+            f"WHERE id = %s RETURNING {_WAITLIST_COLS}",
+            (reservation["id"], entry["id"]),
+        ).fetchone()
+        promoted.append({"entry": row, "reservation": reservation})
+    return promoted

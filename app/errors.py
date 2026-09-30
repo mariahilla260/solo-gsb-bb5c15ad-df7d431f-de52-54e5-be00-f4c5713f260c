@@ -102,3 +102,32 @@ class ReservationNotReschedulableError(ApiError):
 
     status_code = 409
     code = "reservation_not_reschedulable"
+
+
+# ---------------------------------------------------------------------------
+# Waitlist
+# ---------------------------------------------------------------------------
+
+class WaitlistEntryNotFoundError(ApiError):
+    status_code = 404
+    code = "waitlist_entry_not_found"
+
+
+class InvalidQueryTokenError(ApiError):
+    status_code = 403
+    code = "invalid_query_token"
+
+
+class WindowAvailableError(ApiError):
+    """The requested window is free, so it must be booked directly instead of
+    joining the waitlist."""
+
+    status_code = 409
+    code = "window_available"
+
+
+class WaitlistNotWithdrawableError(ApiError):
+    """Only a queued waitlist entry can be withdrawn."""
+
+    status_code = 409
+    code = "waitlist_not_withdrawable"

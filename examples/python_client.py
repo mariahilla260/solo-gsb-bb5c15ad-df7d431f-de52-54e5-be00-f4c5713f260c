@@ -238,6 +238,96 @@ def main() -> None:
     )
     show("repeat cancel returns the cancelled state", status, again)
 
+    # ------------------------------------------------------------------
+    # Waitlist: queue for a window that is already booked out.  When a
+    # cancellation or reschedule frees it, the earliest eligible entry is
+    # promoted into a real reservation automatically.
+    # ------------------------------------------------------------------
+    status, blocker = call(
+        "POST",
+        f"/points/{rpid}/reservations",
+        {
+            "idempotency_key": "visit-demo-blocker",
+            "start": f"{tomorrow}T10:00:00Z",
+            "end": f"{tomorrow}T11:00:00Z",
+        },
+    )
+    show("a new booking now holds 10:00-11:00", status, blocker)
+
+    wait_window = {
+        "idempotency_key": "wait-demo-1",
+        "start": f"{tomorrow}T10:00:00Z",
+        "end": f"{tomorrow}T11:00:00Z",
+    }
+    status, entry = call("POST", f"/points/{rpid}/waitlist", wait_window)
+    show("apply for the occupied window (201, queued)", status, entry)
+    wid = entry["id"]
+    wtoken = entry["query_token"]
+
+    status, replay = call("POST", f"/points/{rpid}/waitlist", wait_window)
+    show("same key + same content replays the application (200)", status, replay)
+
+    status, conflict = call(
+        "POST",
+        f"/points/{rpid}/waitlist",
+        {
+            "idempotency_key": "wait-demo-1",
+            "start": f"{tomorrow}T10:30:00Z",
+            "end": f"{tomorrow}T11:00:00Z",
+        },
+    )
+    show("same key + different content conflicts", status, conflict)
+
+    status, free = call(
+        "POST",
+        f"/points/{rpid}/waitlist",
+        {
+            "idempotency_key": "wait-demo-free",
+            "start": f"{tomorrow}T08:00:00Z",
+            "end": f"{tomorrow}T08:30:00Z",
+        },
+    )
+    show("a free window cannot join the waitlist (409 window_available)", status, free)
+
+    status, state = call("GET", f"/points/{rpid}/waitlist/{wid}?token={wtoken}")
+    show("lookup with the query token (queued)", status, state)
+
+    status, cancelled = call(
+        "POST",
+        f"/points/{rpid}/reservations/{blocker['id']}/cancel",
+        {"cancel_token": blocker["cancel_token"]},
+    )
+    show("cancel the booking: the release promotes the queued entry", status, cancelled)
+
+    status, state = call("GET", f"/points/{rpid}/waitlist/{wid}?token={wtoken}")
+    show("the entry is promoted (reservation number + cancel token)", status, state)
+
+    # A second entry queued behind the promoted reservation can be withdrawn.
+    status, second = call(
+        "POST",
+        f"/points/{rpid}/waitlist",
+        {
+            "idempotency_key": "wait-demo-2",
+            "start": f"{tomorrow}T10:00:00Z",
+            "end": f"{tomorrow}T11:00:00Z",
+        },
+    )
+    show("a second visitor queues behind the promoted booking", status, second)
+
+    status, withdrawn = call(
+        "POST",
+        f"/points/{rpid}/waitlist/{second['id']}/withdraw",
+        {"query_token": second["query_token"]},
+    )
+    show("withdraw while queued", status, withdrawn)
+
+    status, again = call(
+        "POST",
+        f"/points/{rpid}/waitlist/{second['id']}/withdraw",
+        {"query_token": second["query_token"]},
+    )
+    show("repeat withdraw is idempotent", status, again)
+
 
 if __name__ == "__main__":
     main()

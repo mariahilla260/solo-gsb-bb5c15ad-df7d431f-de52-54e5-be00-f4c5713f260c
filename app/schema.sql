@@ -67,6 +67,11 @@ UPDATE reservations
     OR created_end_utc IS NULL
     OR created_rules_version IS NULL;
 
+-- Reservations created by a waitlist promotion are system-generated and live
+-- outside the client idempotency space: their idempotency_key is NULL, and
+-- multiple NULLs never collide under the UNIQUE constraint.
+ALTER TABLE reservations ALTER COLUMN idempotency_key DROP NOT NULL;
+
 CREATE INDEX IF NOT EXISTS idx_reservations_point_active
     ON reservations (point_id, start_utc) WHERE status = 'active';
 
@@ -90,3 +95,35 @@ CREATE TABLE IF NOT EXISTS reservation_reschedules (
 
 CREATE INDEX IF NOT EXISTS idx_reservation_reschedules_reservation
     ON reservation_reschedules (reservation_id);
+
+-- Waitlist entries for already-booked windows.  (point_id, idempotency_key)
+-- is the client's idempotency scope: the first successful application wins,
+-- same-content retries replay it.  ``query_token`` is the capability token
+-- for looking up / withdrawing the entry.  Lifecycle:
+--   queued -> promoted   (a release turned it into a reservation, at most
+--                         once; promoted_reservation_id records which one)
+--   queued -> withdrawn  (the visitor withdrew while queued)
+--   queued -> expired    (its start had already passed when a release scan
+--                         inspected the queue)
+-- ``rules_version`` records the published version the application window was
+-- validated against; a promotion re-validates against the *then current*
+-- version and issues the reservation under that one.
+CREATE TABLE IF NOT EXISTS waitlist_entries (
+    id                     BIGSERIAL PRIMARY KEY,
+    point_id               BIGINT NOT NULL REFERENCES points(id) ON DELETE CASCADE,
+    idempotency_key        TEXT NOT NULL,
+    start_utc              TIMESTAMPTZ NOT NULL,
+    end_utc                TIMESTAMPTZ NOT NULL,
+    rules_version          INTEGER NOT NULL,        -- version validated against at apply time
+    query_token            TEXT NOT NULL,           -- capability token for lookup/withdraw
+    status                 TEXT NOT NULL DEFAULT 'queued'
+                           CHECK (status IN ('queued', 'promoted', 'withdrawn', 'expired')),
+    promoted_reservation_id BIGINT
+                           REFERENCES reservations(id) ON DELETE SET NULL,
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+    decided_at             TIMESTAMPTZ,             -- when it left the queue
+    UNIQUE (point_id, idempotency_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_waitlist_entries_point_queued
+    ON waitlist_entries (point_id, id) WHERE status = 'queued';

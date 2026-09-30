@@ -80,6 +80,14 @@ class ReservationCancelIn(BaseModel):
     cancel_token: str | None = None
 
 
+class WaitlistCreateIn(ReservationCreateIn):
+    """Waitlist application: same payload shape as a reservation create."""
+
+
+class WaitlistWithdrawIn(BaseModel):
+    query_token: str | None = None
+
+
 class ReservationRescheduleIn(BaseModel):
     """Reschedule request: capability token + optimistic revision + new window.
 
@@ -320,3 +328,41 @@ class ReservationStateOut(BaseModel):
     rules_version: int
     created_at: datetime
     cancelled_at: datetime | None
+
+
+class WaitlistOut(BaseModel):
+    """Returned when a waitlist application is accepted (201) or replayed (200).
+
+    ``rules_version`` is the published version the window was validated
+    against at apply time; the window itself never changes afterwards, while
+    ``status`` reflects the entry as it stands now.
+    """
+
+    id: int
+    point_id: int
+    status: str
+    start: str
+    end: str
+    rules_version: int
+    query_token: str
+    promoted_reservation_id: int | None
+    created_at: datetime
+    decided_at: datetime | None
+
+
+class WaitlistStateOut(BaseModel):
+    """Public state of a waitlist entry (no query token).
+
+    ``reservation`` is present once the entry has been promoted: it carries
+    the issued reservation number and its cancel token.
+    """
+
+    id: int
+    point_id: int
+    status: str
+    start: str
+    end: str
+    rules_version: int
+    created_at: datetime
+    decided_at: datetime | None
+    reservation: ReservationOut | None

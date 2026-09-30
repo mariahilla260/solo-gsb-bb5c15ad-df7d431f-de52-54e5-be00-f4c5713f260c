@@ -212,8 +212,85 @@ api POST "/points/$RPID/reservations/$RID/cancel" "{\"cancel_token\":\"$TOKEN\"}
 
 echo
 echo "-- the freed window can be booked again (201) --"
-api POST "/points/$RPID/reservations" "{
+RES5_JSON="$(api POST "/points/$RPID/reservations" "{
   \"idempotency_key\": \"demo-visit-5\",
   \"start\": \"${D1}T10:00:00Z\",
   \"end\": \"${D1}T11:00:00Z\"
+}")"
+echo "$RES5_JSON"
+RID5="$(echo "$RES5_JSON" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+TOKEN5="$(echo "$RES5_JSON" | sed -n 's/.*"cancel_token":"\([^"]*\)".*/\1/p')"
+
+echo
+echo "== 8. Waitlist (queue for a window that is already booked) =="
+# The demo point is open 08:00-12:00 tomorrow; 10:00-11:00 is now held by
+# demo-visit-5.  A visitor who wants that same window joins the waitlist.
+echo "-- apply for the occupied 10:00-11:00 window (201, queued) --"
+WL_JSON="$(api POST "/points/$RPID/waitlist" "{
+  \"idempotency_key\": \"demo-wait-1\",
+  \"start\": \"${D1}T10:00:00Z\",
+  \"end\": \"${D1}T11:00:00Z\"
+}")"
+echo "$WL_JSON"
+WID="$(echo "$WL_JSON" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+WTOKEN="$(echo "$WL_JSON" | sed -n 's/.*"query_token":"\([^"]*\)".*/\1/p')"
+
+echo
+echo "-- same key + same content replays the application (200) --"
+api POST "/points/$RPID/waitlist" "{
+  \"idempotency_key\": \"demo-wait-1\",
+  \"start\": \"${D1}T10:00:00Z\",
+  \"end\": \"${D1}T11:00:00Z\"
 }"
+
+echo
+echo "-- same key + different content conflicts (409 idempotency_conflict) --"
+api POST "/points/$RPID/waitlist" "{
+  \"idempotency_key\": \"demo-wait-1\",
+  \"start\": \"${D1}T10:30:00Z\",
+  \"end\": \"${D1}T11:00:00Z\"
+}"
+
+echo
+echo "-- a free window cannot join the waitlist (409 window_available) --"
+api POST "/points/$RPID/waitlist" "{
+  \"idempotency_key\": \"demo-wait-free\",
+  \"start\": \"${D1}T08:00:00Z\",
+  \"end\": \"${D1}T08:30:00Z\"
+}"
+
+echo
+echo "-- lookup without the query token is rejected (403 invalid_query_token) --"
+api GET "/points/$RPID/waitlist/$WID"
+
+echo
+echo "-- lookup with the query token (200, still queued) --"
+api GET "/points/$RPID/waitlist/$WID?token=$WTOKEN"
+
+echo
+echo "-- a second visitor queues for the same window (201) --"
+WL2_JSON="$(api POST "/points/$RPID/waitlist" "{
+  \"idempotency_key\": \"demo-wait-2\",
+  \"start\": \"${D1}T10:00:00Z\",
+  \"end\": \"${D1}T11:00:00Z\"
+}")"
+echo "$WL2_JSON"
+WID2="$(echo "$WL2_JSON" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+WTOKEN2="$(echo "$WL2_JSON" | sed -n 's/.*"query_token":"\([^"]*\)".*/\1/p')"
+
+echo
+echo "-- cancelling the booking promotes the earliest queued entry --"
+api POST "/points/$RPID/reservations/$RID5/cancel" "{\"cancel_token\":\"$TOKEN5\"}"
+
+echo
+echo "-- the first entry is now promoted and shows its reservation + cancel token --"
+api GET "/points/$RPID/waitlist/$WID?token=$WTOKEN"
+
+echo
+echo "-- the second entry is still queued (it overlaps the promoted one); withdraw it --"
+api GET "/points/$RPID/waitlist/$WID2?token=$WTOKEN2"
+api POST "/points/$RPID/waitlist/$WID2/withdraw" "{\"query_token\":\"$WTOKEN2\"}"
+
+echo
+echo "-- repeat withdraw is idempotent (200, still withdrawn) --"
+api POST "/points/$RPID/waitlist/$WID2/withdraw" "{\"query_token\":\"$WTOKEN2\"}"

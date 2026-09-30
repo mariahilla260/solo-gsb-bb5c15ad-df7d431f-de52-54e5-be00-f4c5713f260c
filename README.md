@@ -2,7 +2,8 @@
 
 为社区回收点维护**每周开放时段**、**指定日期全天停开**与**当日补开时段**，
 按当地日期范围查询，逐日返回**实际开放区间的 UTC 起止、当地日期和来源**；
-并支持以当前已发布日历为准的**到访预约**（幂等创建、凭证取消、变更保护）。
+并支持以当前已发布日历为准的**到访预约**（幂等创建、凭证取消、变更保护）
+与已占用时段的**候补排队**（凭密钥查询/撤回、释放时按申请先后自动转正）。
 
 技术栈：Python 3.11 · FastAPI · PostgreSQL 16 · psycopg 3 · Uvicorn。
 
@@ -122,6 +123,25 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
     在新日历下不再完整开放，整个变更被拒绝并返回冲突预约号列表；
     预约创建、改期、规则发布与时区修改在同一回收点行锁下串行，并发下同样
     满足日历覆盖与无重叠。
+- **候补（waitlist）**：
+  - 目标时段已被预约占用时，访客可提交 UTC 起止与幂等键申请候补；
+    窗口须通过与创建预约相同的时长/提前期校验、被当前已发布日历完整
+    覆盖，且**与至少一个未取消预约重叠**——空闲窗口不属于候补场景，
+    会被拒绝并提示直接走预约流程（`window_available`）；
+  - 成功返回**候补号、查询密钥（`query_token`）与排队状态**；幂等键按
+    回收点隔离：同点同键同内容重试返回原申请（HTTP 200，状态字段反映
+    当前状态），异内容报 `idempotency_conflict`；
+  - 凭查询密钥可查询本人候补状态；转正后响应附带**预约号与取消凭证**；
+    排队中（`queued`）可凭密钥撤回，重复撤回幂等返回；
+  - **转正**：取消或改期释放时段时，在同一事务中按申请先后检查该点
+    候补队列——开始时间已过的标记 `expired`；当前规则下不再开放或仍与
+    未取消预约冲突的暂留队列（`queued`）；最早可用者自动转为预约，
+    **按转正时的当前规则版本**签发预约与取消凭证。每个候补**只能转正
+    一次**（`promoted` 为终态，其预约日后再被取消也不会重复转正）；
+  - 候补申请、撤回、转正与预约创建/取消/改期/规则发布在同一回收点行锁
+    下串行：并发下不产生重叠、不错用旧日历；转正失败的整个事务（含
+    释放操作与候补状态变更）一并回滚；
+  - 候补不占用时段：新预约照常创建，只在释放事件发生时按队列转正。
 
 ---
 
@@ -312,7 +332,90 @@ GET /points/{id}/calendar?from=YYYY-MM-DD&to=YYYY-MM-DD[&version=N]
   `409 reservation_overlap`。
 - 任一失败均在同一事务内回滚：原时段继续被占用，修订号与窗口不变。
 
-### 4.5 可区分错误码
+### 4.5 候补（waitlist）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `POST` | `/points/{id}/waitlist` | 申请候补（201；同键同内容重试为 200） |
+| `GET` | `/points/{id}/waitlist/{wid}?token=…` | 凭查询密钥查看候补状态（转正后含预约号与取消凭证） |
+| `POST` | `/points/{id}/waitlist/{wid}/withdraw` | 凭查询密钥撤回排队中的候补（200，可重复） |
+
+申请请求体与创建预约同构（`start`/`end` 为带时区偏移的 ISO-8601 时间戳）：
+
+```json
+{
+  "idempotency_key": "wait-2026-0930-0001",
+  "start": "2026-10-01T09:00:00Z",
+  "end": "2026-10-01T10:00:00Z"
+}
+```
+
+- 仅接受符合预约时长/提前期策略、被当前已发布日历完整覆盖、且与至少
+  一个未取消预约重叠的窗口；窗口空闲时返回 `409 window_available`，
+  应改用 `POST /points/{id}/reservations` 直接预约。
+- 成功响应（201）包含**候补号、查询密钥与排队状态**：
+
+```json
+{
+  "id": 3,
+  "point_id": 1,
+  "status": "queued",
+  "start": "2026-10-01T09:00:00Z",
+  "end": "2026-10-01T10:00:00Z",
+  "rules_version": 3,
+  "query_token": "k8Qx…",
+  "promoted_reservation_id": null,
+  "created_at": "2026-09-30T08:00:00Z",
+  "decided_at": null
+}
+```
+
+- 同一回收点内同一 `idempotency_key` 以首次成功申请为准：同内容重试
+  返回原申请（HTTP 200，`status` 反映当前状态），不同内容返回
+  `409 idempotency_conflict`。
+- 候补状态机：`queued`（排队中）→ `promoted`（已转正）/ `withdrawn`
+  （已撤回）/ `expired`（释放检查时发现开始时间已过）。
+- 查询响应在转正后附带预约号与取消凭证（`reservation` 字段，否则为
+  `null`）；缺失或错误的查询密钥返回 `403 invalid_query_token`，候补
+  不存在返回 `404 waitlist_entry_not_found`：
+
+```json
+{
+  "id": 3,
+  "point_id": 1,
+  "status": "promoted",
+  "start": "2026-10-01T09:00:00Z",
+  "end": "2026-10-01T10:00:00Z",
+  "rules_version": 3,
+  "created_at": "2026-09-30T08:00:00Z",
+  "decided_at": "2026-09-30T09:12:00Z",
+  "reservation": {
+    "id": 11,
+    "point_id": 1,
+    "status": "active",
+    "revision": 1,
+    "start": "2026-10-01T09:00:00Z",
+    "end": "2026-10-01T10:00:00Z",
+    "rules_version": 4,
+    "cancel_token": "r9vQ…",
+    "created_at": "2026-09-30T09:12:00Z",
+    "cancelled_at": null
+  }
+}
+```
+
+  其中候补的 `rules_version` 是**申请时**校验依据的版本，转正预约的
+  `rules_version` 是**转正时**的当前已发布版本。
+- 撤回请求体为 `{ "query_token": "…" }`；仅 `queued` 状态可撤回，重复
+  撤回幂等返回 `withdrawn`；已转正/已失效的候补返回
+  `409 waitlist_not_withdrawable`（`details.reason` 为
+  `already_promoted` / `already_expired`）。
+- **转正时机**：预约取消或改期释放时段时，在同一事务内按申请先后扫描
+  该点候补队列，最早可用者自动转为预约（新预约不占用客户幂等键空间，
+  其取消凭证随查询响应签发）；仍不满足条件的候补暂留队列，等待下一次
+  释放检查。
+
+### 4.6 可区分错误码
 
 | HTTP | `error.code` | 触发场景 |
 | --- | --- | --- |
@@ -328,6 +431,10 @@ GET /points/{id}/calendar?from=YYYY-MM-DD&to=YYYY-MM-DD[&version=N]
 | 409 | `revision_conflict` | 改期 `expected_revision` 与预约当前修订号不符（`details` 给出双方修订号） |
 | 409 | `reservation_not_reschedulable` | 改期对象已取消或已开始（`details.reason` 区分 `reservation_cancelled` / `reservation_started`） |
 | 409 | `reservation_change_conflict` | 发布规则或修改时区将使未取消预约不再完整开放（`details.conflicting_reservation_ids` 给出冲突预约号） |
+| 404 | `waitlist_entry_not_found` | 候补号不存在（或不属于该回收点） |
+| 403 | `invalid_query_token` | 查询/撤回候补时未提供查询密钥或密钥不匹配 |
+| 409 | `window_available` | 候补申请的窗口当前空闲（未与任何未取消预约重叠），应直接走预约流程 |
+| 409 | `waitlist_not_withdrawable` | 候补已转正或已失效，不可撤回（`details.reason` 区分 `already_promoted` / `already_expired`） |
 | 422 | `invalid_period` | 无效时段：星期越界、时间格式错、常规起终点相等、补开跨日/零长度、重复规则、日期范围倒置/超限；预约终点不晚于起点、超过最长时长、起点在过去或超出可约天数 |
 | 422 | `unknown_timezone` | 无法识别的 IANA 时区 |
 | 422 | `invalid_request` | 请求体结构未通过校验（字段缺失、类型错误、时间戳缺时区偏移等） |
@@ -380,6 +487,29 @@ curl -s -X POST localhost:8000/points/1/reservations/7/reschedule \
        "end":"2026-10-01T11:30:00Z"}'
 ```
 
+候补快速体验（目标时段已被占用时）：
+
+```bash
+# 申请候补：窗口须被当前日历覆盖且与未取消预约重叠
+curl -s -X POST localhost:8000/points/1/waitlist \
+  -H 'Content-Type: application/json' \
+  -d '{"idempotency_key":"wait-0001",
+       "start":"2026-10-01T09:00:00Z",
+       "end":"2026-10-01T10:00:00Z"}'
+# → 201 {"id":3, "status":"queued", "query_token":"k8Qx…", ...}
+
+# 凭候补号与查询密钥查看状态（转正后含预约号与取消凭证）
+curl -s "localhost:8000/points/1/waitlist/3?token=<query_token>"
+
+# 排队中凭密钥撤回（可重复调用）
+curl -s -X POST localhost:8000/points/1/waitlist/3/withdraw \
+  -H 'Content-Type: application/json' \
+  -d '{"query_token":"<query_token>"}'
+
+# 占用该窗口的预约被取消或改期后，最早可用的候补自动转正；
+# 再次查询即可看到 status="promoted" 与 reservation.cancel_token
+```
+
 ---
 
 ## 6. 本地开发与测试
@@ -407,6 +537,11 @@ pytest -q
   （含再改期/取消后重放）、异内容冲突、过期修订号冲突、已取消/已开始不可改、
   新窗口窗口策略/开放区间/重叠（忽略自身）校验、失败不释放原时段、原创建键
   重试仍按首次创建内容判定、改期与取消/发布并发下结果一致且无 500；
+- 候补：占用窗口可申请（返回候补号/查询密钥/排队状态）、空闲窗口拒绝、
+  窗口策略与日历覆盖校验、幂等重放与异内容冲突、凭密钥查询/撤回与重复撤回、
+  取消与改期释放触发转正、先到先转与仍冲突暂留、开始已过标记失效、规则
+  变更后不再开放暂留并在后续释放时按转正时版本签发、只能转正一次、
+  并发取消/创建下不产生重叠且无 500；
 - 全部可区分错误码。
 
 ---
@@ -417,7 +552,7 @@ pytest -q
 app/
   config.py      环境变量配置
   schema.sql     PostgreSQL 建表脚本（启动时幂等执行）
-  db.py          连接池、版本化规则的原子发布与读取、预约存储（行锁 + 事务）
+  db.py          连接池、版本化规则的原子发布与读取、预约/候补存储（行锁 + 事务）
   scheduler.py   纯 Python 日历展开引擎（跨午夜/停开/补开/合并/DST/连续开放区间）
   schemas.py     Pydantic 请求响应模型与时段语义校验
   errors.py      可区分错误类型

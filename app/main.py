@@ -21,6 +21,7 @@ from .errors import (
     ReservationNotReschedulableError,
     ReservationOverlapError,
     RevisionConflictError,
+    WindowAvailableError,
 )
 from .schemas import (
     CalendarOut,
@@ -38,6 +39,10 @@ from .schemas import (
     ReservationStateOut,
     VersionOut,
     VersionSummaryOut,
+    WaitlistCreateIn,
+    WaitlistOut,
+    WaitlistStateOut,
+    WaitlistWithdrawIn,
     utc_iso,
     validate_reservation_window,
     validate_rules_payload,
@@ -443,9 +448,18 @@ def cancel_reservation(
 ) -> ReservationStateOut:
     with db.conn() as connection:
         with connection.transaction():
+            cur = connection.cursor()
+            # Cancelling frees a window and may promote waitlist entries into
+            # new reservations, so it takes the same per-point lock as
+            # creation / reschedule / publish: promotions can never overlap a
+            # concurrent booking or be validated against a stale calendar.
+            db.lock_point(cur, point_id)
             row = db.cancel_reservation(
-                connection.cursor(), point_id, reservation_id, body.cancel_token
+                cur, point_id, reservation_id, body.cancel_token
             )
+            # The release and the promotions it triggers commit or roll back
+            # as one transaction.
+            db.process_waitlist(cur, point_id, datetime.now(timezone.utc))
     return _reservation_state_out(row)
 
 
@@ -609,7 +623,183 @@ def reschedule_reservation(
                 end,
                 rules_row["version"],
             )
+            # The old window was released by the move: promote eligible
+            # waitlist entries in the same transaction (a failure rolls the
+            # reschedule back together with the promotions).
+            db.process_waitlist(cur, point_id, now)
             # Rescheduling only moves the window and bumps the revision;
             # status / cancel token / created_at are unchanged, so the locked
             # ``resv`` row plus the stored attempt fully describe the result.
             return _reschedule_replay_out(resv, attempt)
+
+
+# ---------------------------------------------------------------------------
+# Waitlist — queue for a window that is currently booked out
+# ---------------------------------------------------------------------------
+
+def _waitlist_out(row: dict) -> WaitlistOut:
+    return WaitlistOut(
+        id=row["id"],
+        point_id=row["point_id"],
+        status=row["status"],
+        start=utc_iso(row["start_utc"]),
+        end=utc_iso(row["end_utc"]),
+        rules_version=row["rules_version"],
+        query_token=row["query_token"],
+        promoted_reservation_id=row["promoted_reservation_id"],
+        created_at=row["created_at"],
+        decided_at=row["decided_at"],
+    )
+
+
+def _waitlist_state_out(cur, row: dict) -> WaitlistStateOut:
+    reservation = None
+    if row["promoted_reservation_id"] is not None:
+        promoted = db.get_reservation(
+            cur, row["point_id"], row["promoted_reservation_id"]
+        )
+        if promoted is not None:
+            reservation = _reservation_out(promoted)
+    return WaitlistStateOut(
+        id=row["id"],
+        point_id=row["point_id"],
+        status=row["status"],
+        start=utc_iso(row["start_utc"]),
+        end=utc_iso(row["end_utc"]),
+        rules_version=row["rules_version"],
+        created_at=row["created_at"],
+        decided_at=row["decided_at"],
+        reservation=reservation,
+    )
+
+
+@app.post(
+    "/points/{point_id}/waitlist",
+    response_model=WaitlistOut,
+    status_code=201,
+    tags=["waitlist"],
+)
+def create_waitlist_entry(
+    point_id: int, body: WaitlistCreateIn, response: Response
+) -> WaitlistOut:
+    start = body.start.astimezone(timezone.utc)
+    end = body.end.astimezone(timezone.utc)
+    now = datetime.now(timezone.utc)
+    with db.conn() as connection:
+        with connection.transaction():
+            cur = connection.cursor()
+            # Same per-point lock as reservation creation: the overlap check
+            # below and the queued entry it inserts always agree with the
+            # committed reservation state.
+            point = db.lock_point(cur, point_id)
+
+            # Idempotency: the first successful application wins.  A
+            # same-content retry replays it (the window never changes; the
+            # status reflects the entry as it stands now); different content
+            # under the same key conflicts.
+            existing = db.get_waitlist_entry_by_key(
+                cur, point_id, body.idempotency_key
+            )
+            if existing is not None:
+                if (
+                    existing["start_utc"] == start
+                    and existing["end_utc"] == end
+                ):
+                    response.status_code = 200
+                    return _waitlist_out(existing)
+                raise IdempotencyConflictError(
+                    f"idempotency key {body.idempotency_key!r} was already used "
+                    f"on point {point_id} with a different time window",
+                    details={
+                        "entry_id": existing["id"],
+                        "start": utc_iso(existing["start_utc"]),
+                        "end": utc_iso(existing["end_utc"]),
+                    },
+                )
+
+            # Same window policy as a reservation: duration cap, lead time,
+            # and full containment in the currently published calendar.
+            validate_reservation_window(
+                start,
+                end,
+                now,
+                max_days_ahead=settings.reservation_max_days_ahead,
+                max_duration=timedelta(
+                    minutes=settings.reservation_max_duration_minutes
+                ),
+            )
+            _, rules_row = db.get_current_rules(cur, point_id)
+            zone = get_zone(point["timezone"])
+            ruleset = payload_to_ruleset(rules_row["payload"])
+            date_from = (start - timedelta(days=1)).astimezone(zone).date()
+            date_to = (end + timedelta(days=1)).astimezone(zone).date()
+            intervals = build_open_intervals(
+                point["timezone"], ruleset, date_from, date_to
+            )
+            if not any(s <= start and end <= e for s, e in intervals):
+                raise OutsideOpenHoursError(
+                    "waitlist window is not fully contained in one continuous "
+                    "open interval of the published calendar",
+                    details={
+                        "start": utc_iso(start),
+                        "end": utc_iso(end),
+                        "rules_version": rules_row["version"],
+                    },
+                )
+
+            # A waitlist only makes sense for a booked-out window: it must
+            # overlap at least one active reservation.  Free windows go
+            # through the normal reservation flow instead.
+            if not db.find_overlapping(cur, point_id, start, end):
+                raise WindowAvailableError(
+                    "the requested window does not overlap any active "
+                    "reservation; book it directly via "
+                    f"POST /points/{point_id}/reservations",
+                    details={"start": utc_iso(start), "end": utc_iso(end)},
+                )
+
+            row = db.insert_waitlist_entry(
+                cur,
+                point_id,
+                body.idempotency_key,
+                start,
+                end,
+                rules_row["version"],
+            )
+    return _waitlist_out(row)
+
+
+@app.get(
+    "/points/{point_id}/waitlist/{entry_id}",
+    response_model=WaitlistStateOut,
+    tags=["waitlist"],
+)
+def read_waitlist_entry(
+    point_id: int,
+    entry_id: int,
+    token: str | None = Query(
+        default=None, description="Query token issued at application time."
+    ),
+) -> WaitlistStateOut:
+    with db.conn() as connection:
+        cur = connection.cursor()
+        row = db.get_waitlist_entry(cur, point_id, entry_id)
+        db.check_query_token(row, token)
+        return _waitlist_state_out(cur, row)
+
+
+@app.post(
+    "/points/{point_id}/waitlist/{entry_id}/withdraw",
+    response_model=WaitlistStateOut,
+    tags=["waitlist"],
+)
+def withdraw_waitlist_entry(
+    point_id: int, entry_id: int, body: WaitlistWithdrawIn
+) -> WaitlistStateOut:
+    with db.conn() as connection:
+        with connection.transaction():
+            cur = connection.cursor()
+            row = db.withdraw_waitlist_entry(
+                cur, point_id, entry_id, body.query_token
+            )
+            return _waitlist_state_out(cur, row)
