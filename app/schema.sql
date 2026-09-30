@@ -90,3 +90,37 @@ CREATE TABLE IF NOT EXISTS reservation_reschedules (
 
 CREATE INDEX IF NOT EXISTS idx_reservation_reschedules_reservation
     ON reservation_reschedules (reservation_id);
+
+-- Waitlist (候补) entries.  A visitor may only join the waitlist for a window
+-- that *would* be bookable under the current rules but is currently taken by an
+-- active (non-cancelled) reservation.  (point_id, idempotency_key) is the
+-- idempotency scope, mirroring reservations: same key + same content replays
+-- the original application, different content conflicts.
+--
+-- status lifecycle:
+--   waiting   -- queued; ordered by (point_id, id), i.e. application order
+--   promoted  -- converted into a reservation (reservation_id set), exactly once
+--   expired   -- start time had already passed when a release sweep ran
+--   withdrawn -- holder of query_token withdrew it while still waiting
+CREATE TABLE IF NOT EXISTS waitlist_entries (
+    id              BIGSERIAL PRIMARY KEY,
+    point_id        BIGINT NOT NULL REFERENCES points(id) ON DELETE CASCADE,
+    idempotency_key TEXT NOT NULL,
+    start_utc       TIMESTAMPTZ NOT NULL,
+    end_utc         TIMESTAMPTZ NOT NULL,
+    rules_version   INTEGER NOT NULL,        -- published version validated at apply time
+    query_token     TEXT NOT NULL,           -- capability token for status/withdraw
+    status          TEXT NOT NULL DEFAULT 'waiting'
+                    CHECK (status IN ('waiting', 'promoted', 'expired', 'withdrawn')),
+    reservation_id  BIGINT REFERENCES reservations(id) ON DELETE SET NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (point_id, idempotency_key)
+);
+
+-- The release sweep locks the point row and then scans the waiting queue in
+-- application order; this partial index is the queue.
+CREATE INDEX IF NOT EXISTS idx_waitlist_point_waiting
+    ON waitlist_entries (point_id, id) WHERE status = 'waiting';
+
+CREATE INDEX IF NOT EXISTS idx_waitlist_point_reservation
+    ON waitlist_entries (point_id, reservation_id);

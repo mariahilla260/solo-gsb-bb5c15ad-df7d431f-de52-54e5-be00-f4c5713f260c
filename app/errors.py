@@ -102,3 +102,36 @@ class ReservationNotReschedulableError(ApiError):
 
     status_code = 409
     code = "reservation_not_reschedulable"
+
+
+# ---------------------------------------------------------------------------
+# Waitlist (候补)
+# ---------------------------------------------------------------------------
+
+
+class WaitlistEntryNotFoundError(ApiError):
+    """Waitlist number does not exist (or does not belong to this point)."""
+
+    status_code = 404
+    code = "waitlist_entry_not_found"
+
+
+class InvalidWaitlistTokenError(ApiError):
+    """Status query / withdrawal presented no or a wrong capability token."""
+
+    status_code = 403
+    code = "invalid_waitlist_token"
+
+
+class WaitlistWindowAvailableError(ApiError):
+    """The requested window is currently bookable — waitlist does not apply."""
+
+    status_code = 409
+    code = "waitlist_window_available"
+
+
+class WaitlistEntryNotActiveError(ApiError):
+    """Withdrawal target is no longer waiting (promoted/expired/withdrawn)."""
+
+    status_code = 409
+    code = "waitlist_entry_not_active"

@@ -238,6 +238,93 @@ def main() -> None:
     )
     show("repeat cancel returns the cancelled state", status, again)
 
+    # ------------------------------------------------------------------
+    # Waitlist (候补): apply for a window already taken by someone else.
+    # At this point demo-visit-3 holds 09:00-10:00 and demo-visit-5 holds
+    # 10:00-11:00, so take a fresh 08:00-08:30 slot as the holder.
+    # ------------------------------------------------------------------
+    holder = call(
+        "POST",
+        f"/points/{rpid}/reservations",
+        {
+            "idempotency_key": "visit-demo-holder",
+            "start": f"{tomorrow}T08:00:00Z",
+            "end": f"{tomorrow}T08:30:00Z",
+        },
+    )[1]
+    show("a new holder occupies 08:00-08:30", 201, holder)
+
+    wait_body = {
+        "idempotency_key": "visit-demo-wait",
+        "start": f"{tomorrow}T08:00:00Z",
+        "end": f"{tomorrow}T08:30:00Z",
+    }
+    status, waiting = call("POST", f"/points/{rpid}/waitlist", wait_body)
+    show("join the waitlist for the occupied 08:00-08:30 window", status, waiting)
+    wid = waiting["id"]
+    wtoken = waiting["query_token"]
+
+    status, w_replay = call("POST", f"/points/{rpid}/waitlist", wait_body)
+    show("same key + same content replays the application (200)", status, w_replay)
+
+    status, w_conflict = call(
+        "POST",
+        f"/points/{rpid}/waitlist",
+        {
+            "idempotency_key": "visit-demo-wait",
+            "start": f"{tomorrow}T08:15:00Z",
+            "end": f"{tomorrow}T08:45:00Z",
+        },
+    )
+    show("same key + different content conflicts", status, w_conflict)
+
+    status, free = call(
+        "POST",
+        f"/points/{rpid}/waitlist",
+        {
+            "idempotency_key": "visit-demo-free-window",
+            "start": f"{tomorrow}T11:30:00Z",
+            "end": f"{tomorrow}T12:00:00Z",
+        },
+    )
+    show("a free window is not accepted onto the waitlist", status, free)
+
+    status, w_state = call(
+        "GET",
+        f"/points/{rpid}/waitlist/{wid}?query_token={wtoken}",
+    )
+    show("query own waitlist state with the query key", status, w_state)
+
+    # A second application, withdrawn while still queued.
+    _, w2 = call(
+        "POST",
+        f"/points/{rpid}/waitlist",
+        {
+            "idempotency_key": "visit-demo-wait-2",
+            "start": f"{tomorrow}T08:00:00Z",
+            "end": f"{tomorrow}T08:15:00Z",
+        },
+    )
+    status, withdrawn = call(
+        "POST",
+        f"/points/{rpid}/waitlist/{w2['id']}/withdraw",
+        {"query_token": w2["query_token"]},
+    )
+    show("withdraw a queued application with the query key", status, withdrawn)
+
+    status, promoted = call(
+        "POST",
+        f"/points/{rpid}/reservations/{holder['id']}/cancel",
+        {"cancel_token": holder["cancel_token"]},
+    )
+    show("cancelling the holder runs the promotion sweep atomically", status, promoted)
+
+    status, w_state = call(
+        "GET",
+        f"/points/{rpid}/waitlist/{wid}?query_token={wtoken}",
+    )
+    show("waitlist entry is now promoted and carries the reservation", status, w_state)
+
 
 if __name__ == "__main__":
     main()

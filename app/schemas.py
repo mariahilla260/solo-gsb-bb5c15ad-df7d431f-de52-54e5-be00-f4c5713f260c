@@ -104,6 +104,30 @@ class ReservationRescheduleIn(BaseModel):
         return value
 
 
+class WaitlistCreateIn(BaseModel):
+    """Waitlist (候补) application: UTC window + client idempotency key."""
+
+    idempotency_key: str = Field(min_length=1, max_length=200)
+    start: datetime
+    end: datetime
+
+    @field_validator("start", "end")
+    @classmethod
+    def _must_be_timezone_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(
+                "must be an ISO-8601 timestamp with an explicit UTC offset "
+                "(e.g. 2026-10-01T09:00:00Z)"
+            )
+        return value
+
+
+class WaitlistTokenIn(BaseModel):
+    """Body of the withdraw endpoint; also used for token-bearing queries."""
+
+    query_token: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
@@ -320,3 +344,24 @@ class ReservationStateOut(BaseModel):
     rules_version: int
     created_at: datetime
     cancelled_at: datetime | None
+
+
+class WaitlistOut(BaseModel):
+    """Waitlist application state returned by apply / status / withdraw.
+
+    ``position`` is the 1-based place in the application-ordered waiting queue
+    and is present only while the entry is still ``waiting``.  Once promoted,
+    ``reservation`` carries the live reservation snapshot (including the
+    cancel token needed to cancel or reschedule it).
+    """
+
+    id: int
+    point_id: int
+    status: str
+    position: int | None = None
+    start: str
+    end: str
+    rules_version: int
+    query_token: str
+    created_at: datetime
+    reservation: ReservationOut | None = None

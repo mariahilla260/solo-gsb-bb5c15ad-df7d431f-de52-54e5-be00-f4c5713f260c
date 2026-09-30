@@ -217,3 +217,92 @@ api POST "/points/$RPID/reservations" "{
   \"start\": \"${D1}T10:00:00Z\",
   \"end\": \"${D1}T11:00:00Z\"
 }"
+
+echo
+echo "== 8. Waitlist (候补) =="
+# A dedicated point for the waitlist walk-through.
+WPOINT_JSON="$(api POST /points '{"name":"候补演示点","timezone":"UTC"}')"
+echo "$WPOINT_JSON"
+WPID="$(echo "$WPOINT_JSON" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+api POST "/points/$WPID/rules" "{
+  \"expected_version\": 0,
+  \"rules\": {
+    \"weekly\": [{\"weekday\": $WD, \"start_time\": \"08:00\", \"end_time\": \"12:00\"}],
+    \"closed_dates\": [],
+    \"makeup\": []
+  }
+}"
+
+echo
+echo "-- someone holds 08:00-08:30 (201) --"
+HOLD_JSON="$(api POST "/points/$WPID/reservations" "{
+  \"idempotency_key\": \"demo-holder\",
+  \"start\": \"${D1}T08:00:00Z\",
+  \"end\": \"${D1}T08:30:00Z\"
+}")"
+echo "$HOLD_JSON"
+HOLD_ID="$(echo "$HOLD_JSON" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+HOLD_TOKEN="$(echo "$HOLD_JSON" | sed -n 's/.*"cancel_token":"\([^"]*\)".*/\1/p')"
+
+echo
+echo "-- join the waitlist for the occupied window (201: number + query key) --"
+WAIT_JSON="$(api POST "/points/$WPID/waitlist" "{
+  \"idempotency_key\": \"demo-wait-1\",
+  \"start\": \"${D1}T08:00:00Z\",
+  \"end\": \"${D1}T08:30:00Z\"
+}")"
+echo "$WAIT_JSON"
+WID="$(echo "$WAIT_JSON" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+WTOKEN="$(echo "$WAIT_JSON" | sed -n 's/.*"query_token":"\([^"]*\)".*/\1/p')"
+
+echo
+echo "-- same point + same key + same content replays the application (200) --"
+api POST "/points/$WPID/waitlist" "{
+  \"idempotency_key\": \"demo-wait-1\",
+  \"start\": \"${D1}T08:00:00Z\",
+  \"end\": \"${D1}T08:30:00Z\"
+}"
+
+echo
+echo "-- same key with different content conflicts (409 idempotency_conflict) --"
+api POST "/points/$WPID/waitlist" "{
+  \"idempotency_key\": \"demo-wait-1\",
+  \"start\": \"${D1}T08:15:00Z\",
+  \"end\": \"${D1}T08:45:00Z\"
+}"
+
+echo
+echo "-- a free window is not accepted onto the waitlist (409 waitlist_window_available) --"
+api POST "/points/$WPID/waitlist" "{
+  \"idempotency_key\": \"demo-wait-free\",
+  \"start\": \"${D1}T11:00:00Z\",
+  \"end\": \"${D1}T11:30:00Z\"
+}"
+
+echo
+echo "-- status query with the query key (200; position is the queue place) --"
+api GET "/points/$WPID/waitlist/$WID?query_token=$WTOKEN"
+
+echo
+echo "-- status query with a wrong key is rejected (403 invalid_waitlist_token) --"
+api GET "/points/$WPID/waitlist/$WID?query_token=wrong"
+
+echo
+echo "-- another queued application, then withdrawn with its query key (200) --"
+WAIT2_JSON="$(api POST "/points/$WPID/waitlist" "{
+  \"idempotency_key\": \"demo-wait-2\",
+  \"start\": \"${D1}T08:00:00Z\",
+  \"end\": \"${D1}T08:15:00Z\"
+}")"
+echo "$WAIT2_JSON"
+WID2="$(echo "$WAIT2_JSON" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+WTOKEN2="$(echo "$WAIT2_JSON" | sed -n 's/.*"query_token":"\([^"]*\)".*/\1/p')"
+api POST "/points/$WPID/waitlist/$WID2/withdraw" "{\"query_token\":\"$WTOKEN2\"}"
+
+echo
+echo "-- cancel the holder: the earliest matching entry is promoted in one transaction --"
+api POST "/points/$WPID/reservations/$HOLD_ID/cancel" "{\"cancel_token\":\"$HOLD_TOKEN\"}"
+
+echo
+echo "-- waitlist status now reports promoted + reservation number/cancel token --"
+api GET "/points/$WPID/waitlist/$WID?query_token=$WTOKEN"
